@@ -46,6 +46,11 @@ const COMBOS = {
 };
 // K mash: a commander flinches from this many shots, each within TAP_GAP s of the last, then shrugs one off
 const TAP_BREAK = 3, TAP_GAP = 0.75;
+// The GM team can have a commander's attention instead of the pilot's (war.js commanderFoe), but not while the pilot is
+// right in its face (within DUEL of it: it keeps its own distance at 5-6, so the pilot has to come in), locked on to
+// it, or has traded a blow with it in the last GRUDGE seconds; and after BORED seconds on GMs with a pilot about it
+// comes back to the pilot for a spell anyway.
+const DUEL = 4, GRUDGE = 3, BORED = 8;
 
 export class Commander {
   constructor(game, cfg) {
@@ -82,6 +87,15 @@ export class Commander {
     this.tapAt = -1e9;
     this.shrug = false; // took a K-mash shot to counter it: the next update goes for the shooter
     this.countering = false; // rushing a K-masher: its shots don't stop this (see damage)
+    this.pilotUntil = -1e9; // game time until which the pilot has its attention for sure (GRUDGE after a blow)
+    this.pilotHitAt = -1e9; // when a pilot last landed a blow on it (a kill the GMs finish just after is the pilot's)
+    this.npcTarget = null; // the GM it is on instead of the pilot (war.js), and its id, since soldiers are pooled
+    this.npcTargetId = 0;
+    this.npcSince = 0; // when it took its eyes off the pilot (BORED), and when it last had a GM in them
+    this.npcLastT = -1e9;
+    this.lostFoe = false; // that GM fell mid-move: the move finishes on the ghost, not on the pilot
+    this.ghost = { npc: true, alive: false, state: 'intro', id: 0, pos: { x: 0, y: 0, z: 0 }, takeHit: () => false };
+    this.onNpc = false;
     this.invuln = 0;
     this.lie = 0;
     this.fired = 0;
@@ -132,13 +146,17 @@ export class Commander {
     const dx = this.pos.x - fromX, dz = this.pos.z - fromZ;
     const l = Math.hypot(dx, dz) || 1;
     if (opts.npc) {
-      // an allied soldier's blow (war.js): a scratch that never staggers, and not the pilots' fight (no boss bar),
-      // but enough of them bring a squad leader down, and then its landing zone falls to the allies
-      this.hp -= dmg;
+      // an allied soldier's blow (war.js): a scratch that never staggers and isn't the pilots' fight (the boss bar
+      // shows it, nothing else does). Enough of them bring a squad leader down, and its landing zone falls to the
+      // allies (to the pilot, if one was just hitting it); an officer or Char they can only wear down so far: the
+      // blow that fells him is a pilot's.
+      this.hp -= Math.min(dmg, Math.max(0, this.hp - g.war.floor(this)));
       this.flash = Math.max(this.flash, 0.35);
-      if (this.hp <= 0) { this.hp = 0; this.byNpc = true; this.defeat(dx / l, dz / l); }
+      if (this.hp <= 0) { this.hp = 0; this.byNpc = g.time - this.pilotHitAt >= GRUDGE; this.defeat(dx / l, dz / l); }
       return true;
     }
+    this.pilotUntil = g.time + GRUDGE; // the pilot's blow (landed or blocked): the duel is on
+    this.pilotHitAt = g.time;
     // guarding blocks frontal hits
     if (this.state === 'guard' && !opts.sp) {
       const facing = Math.sin(this.heading) * -dx / l + Math.cos(this.heading) * -dz / l;
@@ -225,13 +243,37 @@ export class Commander {
         if (p !== hero && p.alive && Math.hypot(p.pos.x - this.pos.x, p.pos.z - this.pos.z) < dc * 0.65) { this.targetIdx = i; hero = p; }
       });
     }
-    // a squad leader whose pilots are away from its post takes on the allied soldiers attacking it (war.js)
-    if (this.home && g.war?.active && this.state !== 'combo' && this.state !== 'aim') {
-      const away = !hero.alive || Math.hypot(hero.pos.x - this.home.x, hero.pos.z - this.home.z) > (this.cfg.leash || 30);
-      this.npcTarget = away ? g.war.captainFoe(this) : null;
+    // the GM team can have its attention instead (war.js): a squad leader's when its pilots have left its post, any
+    // commander's when the pilot has left it alone (DUEL, GRUDGE, lock-on) and a GM is nearer. Not mid-move: a move
+    // finishes on whoever it began on, and on nobody if that GM falls (soldiers are pooled, so the id is checked too).
+    const busy = this.state === 'combo' || this.state === 'aim' || this.state === 'dash';
+    if (g.war?.active && !busy) {
+      const pilotOk = hero.alive && hero.state !== 'intro';
+      const away = !pilotOk || (this.home && Math.hypot(hero.pos.x - this.home.x, hero.pos.z - this.home.z) > (this.cfg.leash || 30));
+      const entering = this.state === 'drop' || this.state === 'taunt';
+      // any pilot right in its face or locked on to it keeps it (co-op: not only the one it is duelling)
+      const held = g.players.some((p) => p.alive && p.state !== 'intro' && (Math.hypot(p.pos.x - this.pos.x, p.pos.z - this.pos.z) < DUEL || this.lockedBy(p)));
+      let duel = entering || (!away && (g.time < this.pilotUntil || held));
+      if (!duel && !away && this.npcTarget && g.time - this.npcSince > BORED) { this.pilotUntil = g.time + GRUDGE; duel = true; }
+      const foe = duel ? null : g.war.commanderFoe(this, hero);
+      if (foe) {
+        if (g.time - this.npcLastT > 1) this.npcSince = g.time; // a fresh spell on the GMs (not the next GM after a kill)
+        this.shrug = false; // a K mash it was about to answer is forgotten
+      }
+      this.npcTarget = foe;
+      this.npcTargetId = foe ? foe.id : 0;
+      this.lostFoe = false;
     }
-    if (this.npcTarget && this.npcTarget.alive) hero = this.npcTarget;
-    const npc = !!hero.npc;
+    if (this.npcTarget) this.npcLastT = g.time;
+    if (this.npcTarget && (!this.npcTarget.alive || this.npcTarget.id !== this.npcTargetId)) {
+      this.npcTarget = null;
+      this.lostFoe = busy;
+      this.ghost.pos.x = this.pos.x + Math.sin(this.heading) * 8;
+      this.ghost.pos.z = this.pos.z + Math.cos(this.heading) * 8;
+    }
+    if (this.npcTarget) hero = this.npcTarget;
+    else if (this.lostFoe && busy) hero = this.ghost;
+    const npc = this.onNpc = !!hero.npc;
     if (this.shudder > 0 && this.state !== 'dead') {
       this.shudder -= dt;
       this.flash = Math.max(0, this.flash - dt * 5);
@@ -253,8 +295,9 @@ export class Commander {
     const target = this.targetPose || (this.targetPose = makePose());
     const sp = this.speed;
     let trailOn = false;
-    // the counter to a K mash (see damage): boost in on the shooter, or swing at once when it's close
-    if (this.shrug) {
+    // the counter to a K mash (see damage): boost in on the shooter, or swing at once when it's close (the shooter has
+    // its attention by then; mid-move on a GM it waits for the move to end)
+    if (this.shrug && !npc) {
       this.shrug = false;
       if (heroOk && !npc && this.state !== 'air' && this.state !== 'down') {
         if (dist > 4.5) this.dash(toHero);
@@ -361,7 +404,7 @@ export class Commander {
           } else { this.vel.x = damp(this.vel.x, 0, 10, dt); this.vel.z = damp(this.vel.z, 0, 10, dt); }
           if (t > 0.14 && t < 0.5 && !this.hitDone && dist < 3.2) {
             this.hitDone = true;
-            hero.takeHit(this.cfg.dmg * 1.6, this.pos.x, this.pos.z, true);
+            this.hit(hero, this.cfg.dmg * 1.6, true);
             g.audio.play('slam', { vol: 0.8, at: npc ? this.pos : null });
           }
           if (t >= 0.8) this.nextComboStep();
@@ -386,7 +429,7 @@ export class Commander {
             const arc = h.shape === 'circle' || h.arc >= 360 ? -1 : Math.cos((h.arc || 120) * Math.PI / 360);
             if (dist < range && dot >= arc && hero.pos.y < 3) {
               this.hitDone = true;
-              hero.takeHit(this.cfg.dmg * (h.big ? 1.5 : 1), this.pos.x, this.pos.z, !!h.big || name === 'N4');
+              this.hit(hero, this.cfg.dmg * (h.big ? 1.5 : 1), !!h.big || name === 'N4');
             }
           }
           if (m.swing !== undefined && t >= m.swing && t - dt * speedMul < m.swing) g.audio.play('hawk', { vol: 0.5, at: this.pos });
@@ -403,7 +446,8 @@ export class Commander {
         const shots = isChar ? 8 : this.kind === 'captain' ? 4 : 6;
         const start = isChar ? 0.6 : 0.85;
         const lock = start - (isChar ? 0.45 : 0.6);
-        // track the target, then lock on and paint the aim line: the burst follows it
+        // track the target, then lock on and paint the aim line: the burst follows it (painted even when the target
+        // is a GM: the rounds are live, and a pilot in the line can still step out of it)
         if (this.t < lock) {
           this.heading = angleDamp(this.heading, toHero, 10, dt);
           this.aimYaw = this.heading;
@@ -412,7 +456,7 @@ export class Commander {
           this.rig.root.updateMatrixWorld(true);
           const from = this.rig.nodes.hand.localToWorld(this._v.set(0, 0, 1.2));
           const L = dist + 8;
-          if (!npc) g.fx.aimLine(from, { x: from.x + Math.sin(this.aimYaw) * L, y: from.y + this.aimY * L, z: from.z + Math.cos(this.aimYaw) * L }, start - lock + shots * 0.1);
+          g.fx.aimLine(from, { x: from.x + Math.sin(this.aimYaw) * L, y: from.y + this.aimY * L, z: from.z + Math.cos(this.aimYaw) * L }, start - lock + shots * 0.1);
         }
         if (this.t >= lock) this.heading = angleDamp(this.heading, this.aimYaw, 20, dt);
         if (this.t > start && this.fired < shots && this.t >= start + this.fired * 0.1) {
@@ -420,7 +464,7 @@ export class Commander {
           this.rig.root.updateMatrixWorld(true);
           const from = this.rig.nodes.hand.localToWorld(this._v.set(0, 0, 1.2));
           const a = this.aimYaw + rand(-0.03, 0.03);
-          g.projectiles.enemyBullet(from, new THREE.Vector3(Math.sin(a), this.aimY, Math.cos(a)).normalize(), isChar ? 1.4 : 1.1);
+          g.projectiles.enemyBullet(from, new THREE.Vector3(Math.sin(a), this.aimY, Math.cos(a)).normalize(), isChar ? 1.4 : 1.1, { officer: true });
           target[P.uArmR * 3] -= 0.1;
         }
         if (this.t > start + shots * 0.1 + 0.3) {
@@ -657,7 +701,22 @@ export class Commander {
     this.rig.root.updateMatrixWorld(true);
     const eye = this.rig.nodes.head.localToWorld(this._v.set(0, 0.25, 0.35));
     g.fx.hit(eye, 0xff3070);
-    if (name !== 'KICK') g.audio.play('hawk', { vol: 0.25, pitch: 1.4, at: this.npcTarget ? this.pos : null });
+    if (name !== 'KICK') g.audio.play('hawk', { vol: 0.25, pitch: 1.4, at: this.onNpc ? this.pos : null });
+  }
+
+  // A blow on whoever it is fighting: a pilot (which keeps the duel going) or a GM (a commander's blow, war.js).
+  hit(hero, dmg, heavy) {
+    const npc = !!hero.npc;
+    if (!hero.takeHit(dmg, this.pos.x, this.pos.z, heavy, npc ? 'officer' : 'melee')) return;
+    if (!npc) this.pilotUntil = Math.max(this.pilotUntil, this.game.time + GRUDGE);
+  }
+
+  // Is this pilot locked on to this commander (the host's own lock, or the one a guest sends with its input)?
+  lockedBy(pilot) {
+    const g = this.game;
+    if (pilot === g.local) return g.lock === this;
+    const s = g.slots?.find((s) => s?.unit === pilot);
+    return !!s && s.input?.lock === this.netId;
   }
 
   nextComboStep() {

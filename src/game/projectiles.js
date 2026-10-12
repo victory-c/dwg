@@ -127,9 +127,13 @@ export class Projectiles {
     if (big) g.shakeFor(owner, 0.15);
   }
 
-  enemyBullet(from, dir, mul = 1) {
+  // A Zeon round. mul: a commander's hits harder (officer: it is a commander's, which a GM feels more, war.js). npc: a
+  // soldier's burst at a GM, fired with no aim line, so it passes the pilots by. fx: whether a pilot is near enough to
+  // see and hear it fired.
+  enemyBullet(from, dir, mul = 1, { npc = false, officer = false, fx = true } = {}) {
     if (this.bullets.length > 250) return;
-    this.bullets.push({ p: from.clone(), d: dir.clone(), life: 0, max: 1.7, speed: BULLET_SPEED, dmg: 4 * mul });
+    this.bullets.push({ p: from.clone(), d: dir.clone(), life: 0, max: 1.7, speed: BULLET_SPEED, dmg: 4 * mul, npc, officer });
+    if (!fx) return;
     this.game.fx.sparks(from, 3, 0xffc070, 5, 0.6, dir);
     this.game.fx.star(from, 0xffa040, 0.4);
     if (Math.random() < 0.5) this.game.audio.play('mg', { vol: 0.28, at: from });
@@ -247,7 +251,7 @@ export class Projectiles {
       const b = this.bullets[i];
       b.life += dt;
       b.p.addScaledVector(b.d, b.speed * dt);
-      if (b.team !== 'fed') for (const pl of g.players) {
+      if (b.team !== 'fed' && !b.npc) for (const pl of g.players) {
         const dx = b.p.x - pl.pos.x, dy = b.p.y - (pl.pos.y + 1.6), dz = b.p.z - pl.pos.z;
         if (dx * dx + dy * dy * 0.4 + dz * dz < 1.3 && pl.alive) {
           pl.takeHit(b.dmg, b.p.x - b.d.x * 5, b.p.z - b.d.z * 5, false, 'bullet');

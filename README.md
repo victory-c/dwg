@@ -42,6 +42,8 @@ Side 7 is laid out like a Dynasty Warriors: Gundam stage: big open fields (the p
 
 Zeon comes in squads, as in the game. Garrisons hold their posts until you come close. Then the mob packs in around you, the front rank at arm's length and the rest a body or two behind, and a few at a time step in to swing. Gunners on the edge of the crowd fire the odd short burst, one at a time. A red aim line shows where it will go, so you can step out of it. Commanders mostly fight hand to hand and paint the same line before they open fire.
 
+The Federation's GM team fights beside you for the fields. GMs cut Zaku down at a fair clip (their kills clear the plaza too, though only yours count as KOs), Zeon splits its attention between you and them (the front rank still comes for you, the rest of the mob turns on GMs that reach it), and squad leaders and commanders turn on GMs that press them while you're not in their face. The GMs can wear a commander down and take a landing zone whose squad leader they fell (announced as TAKEN BY ALLIES), but an officer or Char only falls to you.
+
 1. **The plaza.** Four squads meet you as you land. Clear 50 Zaku.
 2. **Landing zones.** Three supply pods drop into the military yards, each with a garrison and a squad leader. Pods keep dropping reinforcements until you defeat the squad leader and take the zone. An on-screen marker and the minimap point to the nearest one.
 3. **Denim, then Gene.** Commander-type Zaku arrive with a camera cut and name card.

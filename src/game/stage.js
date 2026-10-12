@@ -131,14 +131,20 @@ const PLAZA_KOS = 50;
 // garrison (GMs a field keeps), cap (GMs at most), hp (a GM's; a Zaku has 50), captainHp. zeon: every (seconds
 // between a landing zone's columns), squad, cap (Zaku marching at once). max: a hard cap on both armies together, which
 // every drop counts toward, a pod's landing garrison and the GMs' included (keeps the frame cost in hand).
+// What the armies' blows are worth to each other (the pilots' are untouched): power is the share of a soldier's blow
+// the other army's soldiers take (a GM's 16-23 does ~6 to a 50 HP Zaku: nine blows; a Zaku's does ~1.6 to a 60 HP
+// GM), vsLeader how much of that a field's leader takes (a 4-GM column needs several minutes on a squad leader, so
+// the pilots get there first), vsOfficer how much of it Denim, Gene or Char takes (a trickle on his bar, and never
+// below 30%: the kill is a pilot's), and zeon.officer the share of a Zeon commander's blow a GM takes (a string
+// fells one).
 export const WAR = {
   fields: { PLAZA: { owner: 'fed', lock: true, post: [0, -36] }, ALPHA: 'zeon', BRAVO: 'zeon', CHARLIE: 'zeon' },
   allyCapture: true,
   recapture: true,
   budget: 140,
   max: 150,
-  fed: { every: 12, squad: 4, garrison: 8, cap: 30, hp: 60, captainHp: 300, grace: 60 },
-  zeon: { every: 45, squad: 6, cap: 18 },
+  fed: { every: 12, squad: 4, garrison: 8, cap: 30, hp: 60, captainHp: 300, grace: 60, power: 0.3, vsLeader: 0.25, vsOfficer: 0.1 },
+  zeon: { every: 45, squad: 6, cap: 18, power: 0.08, vsLeader: 0.5, officer: 0.5 },
 };
 const WAR_LINES = {
   taken: (z) => `The GM team has taken LZ ${z}! That's one less for you. Keep pushing!`,
@@ -361,6 +367,15 @@ export class Stage {
       this.dropMeter = 0;
       g.items.drop(worst > 0.8 && Math.random() < 0.6 ? 'sp' : 'hp', e.x, e.z);
     }
+  }
+
+  // The GM team felled a Zaku (war.js): it clears the plaza like anyone's, but it isn't the pilots' KO (no count,
+  // combo or kit).
+  onAllyKill() {
+    if (this.phase !== 'plaza') return;
+    this.plazaKos++;
+    this.game.hud.setObjective(`Clear the plaza · ${Math.min(PLAZA_KOS, this.plazaKos)}/${PLAZA_KOS}`);
+    if (this.plazaKos >= PLAZA_KOS) this.startBases();
   }
 
   startBases() {

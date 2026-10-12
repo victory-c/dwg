@@ -1,8 +1,10 @@
 // The foot soldiers' war, run alongside the mission (Dynasty Warriors: Gundam's allied and enemy troops). Every field
 // belongs to a side. A field its side holds keeps a squad leader and a garrison squatting on it, and calls in more
 // troops at regular intervals; troops beyond the garrison form columns that march down the boulevards to the nearest
-// enemy field and fight to take it (its leader first). The two armies barely scratch each other (NPC_VS_NPC), so a
-// squad-on-squad brawl lasts minutes and fields change hands slowly: the pilots decide the battle.
+// enemy field and fight to take it (its leader first). What one army's blows are worth against the other's is the
+// mission's call (stage.js WAR `power`): the GMs cut Zaku down at a fair clip, Zaku only scratch GMs, and a field's
+// leader shrugs off most of it, so fields change hands slowly and the pilots decide the battle. Zeon's commanders cut
+// GMs down in a string or two, and the GMs can wear an officer down but never finish him: that blow is a pilot's.
 //
 // The mission supplies the config (stage.js WAR): who holds which field at the start, whether each army can take
 // fields on its own (allyCapture, recapture), and the production rates and caps. Zeon's fields are the landing zones
@@ -11,12 +13,20 @@
 import { FIELDS, ROADS, ARENA } from '../world/world.js';
 import { rand } from '../core/util.js';
 
-export const NPC_VS_NPC = 0.08; // share of a blow one army's soldiers do to the other's (the pilots' is untouched)
-export const LEADER_ARMOR = 0.5; // ...and a field's leader takes half even of that
+// Defaults for what a blow between the armies is worth, when the mission's WAR says nothing (the pilots' blows are
+// untouched by any of this): `power` the share of a soldier's blow the other army's soldiers take, `vsLeader` how
+// much of that a field's leader takes, `vsOfficer` (the GMs') how much of it a Zeon officer or Char takes, `officer`
+// (Zeon's) the share of a Zeon commander's blow a GM takes.
+export const NPC_VS_NPC = 0.08;
+export const LEADER_ARMOR = 0.5;
+const OFFICER_BLOW = 0.5; // a Zeon commander's blow on a GM: a string fells one
+const OFFICER_ARMOR = 0.1; // a GM's blow on Denim, Gene or Char: a trickle on the boss bar, never the kill
+const FLOOR = 0.3; // ...and they can't take an officer below this share of his HP
 const MARCH = 3.1; // a column's pace (a soldier walks at 3.7, so the ranks keep up)
 const SIGHT = 17; // a soldier takes on enemy soldiers this close...
-const REACH = 32; // ...as long as a garrison's are this close to its post (garrisons don't chase far)
-const FOCUS = 30; // a column that has reached its target field goes for the field's leader within this range
+const REACH = 32; // ...as long as a garrison's are this close to its post (garrisons don't chase far, unless a pilot drew them off it)
+const FOCUS = 30; // a column that has reached its target field goes for the field's leader within this range...
+const FACE = 4.5; // ...unless an enemy soldier has closed to this on it: that one first
 const ASSAULT = 34; // ...which it has once its anchor is this close to the field's post
 const FIELD_R = 30; // a field's ground, around its post
 const TAU = Math.PI * 2;
@@ -49,7 +59,12 @@ export class War {
   begin(cfg) {
     this.reset();
     if (!cfg) return;
-    this.cfg = cfg;
+    // the per-army damage shares, filled in so a hand-built cfg (tools/wartest.js) keeps the defaults
+    this.cfg = {
+      ...cfg,
+      fed: { power: NPC_VS_NPC, vsLeader: LEADER_ARMOR, vsOfficer: OFFICER_ARMOR, ...cfg.fed },
+      zeon: { power: NPC_VS_NPC, vsLeader: LEADER_ARMOR, officer: OFFICER_BLOW, ...cfg.zeon },
+    };
     this.active = true;
     this.nav();
     for (const def of FIELDS) {
@@ -106,12 +121,16 @@ export class War {
     this.stats.events.push([Math.round(this.game.stats.time), what]);
   }
 
-  // A soldier of either army fell to the other's (or a GM to anything): the armies keep their own tally.
+  // A soldier of either army fell to the other's (or a GM to anything): the armies keep their own tally (and a Zaku
+  // the GMs fell clears the plaza like any other, stage.js).
   onSoldierDown(crowd, g) {
     if (crowd.team === 'fed') {
       this.stats.fedLost++;
       if (g.captain) for (const f of this.fields) if (f.captain === g) { f.captain = null; f.downT = 0; }
-    } else this.stats.zeonLost++;
+    } else {
+      this.stats.zeonLost++;
+      this.game.stage.onAllyKill?.(g);
+    }
   }
 
   // A soldier of a marching column has seen the enemy: the column halts and fights.
@@ -121,15 +140,12 @@ export class War {
   }
 
   // ---------------------------------------------------------------- targets
-  // The nearest enemy soldier (or squad leader) `g` of `crowd` will take on, as a proxy with a pilot's shape; null
-  // for none. A column at the field it came to take goes for the field's leader first.
+  // The nearest enemy soldier (or commander) `g` of `crowd` will take on, as a proxy with a pilot's shape; null for
+  // none. A column at the field it came to take goes for the field's leader first, but fights off a soldier in its
+  // face.
   foeFor(crowd, g) {
     const fed = crowd.team === 'fed', other = crowd.foes, sq = g.squad;
-    if (sq && sq.target && sq.assault) {
-      const cap = this.leaderOf(sq.target, crowd.team);
-      if (cap && cap.alive && Math.hypot(cap.pos.x - g.x, cap.pos.z - g.z) < FOCUS) return cap;
-    }
-    const reach = sq && !sq.march && !sq.target ? REACH : Infinity;
+    const reach = sq && !sq.march && !sq.target && !sq.engaged ? REACH : Infinity;
     const ax = sq ? sq.x : g.x, az = sq ? sq.z : g.z;
     let best = null, bd = SIGHT;
     if (other && other.count) {
@@ -141,14 +157,42 @@ export class War {
         best = o.proxy;
       }
     }
-    if (fed && this.cfg.allyCapture) {
+    if (sq && sq.target && sq.assault && bd > FACE) {
+      const cap = this.leaderOf(sq.target, crowd.team);
+      if (cap && cap.alive && Math.hypot(cap.pos.x - g.x, cap.pos.z - g.z) < FOCUS) return cap;
+    }
+    if (fed) {
+      // Zeon's commanders too: a squad leader like any soldier; an officer only with no soldier left in sight, since
+      // their blows are nothing to him and his cut them down (they mop up his escort while the pilots duel him)
       for (const c of this.game.commanders.list) {
-        if (c.kind !== 'captain' || !c.alive || c.state === 'drop') continue;
+        if (!this.target(c) || (c.kind !== 'captain' && best)) continue;
         const d = Math.hypot(c.pos.x - g.x, c.pos.z - g.z);
-        if (d < bd) { bd = d; best = this.cmdProxy(c); }
+        if (d < bd && (reach === Infinity || Math.hypot(c.pos.x - ax, c.pos.z - az) <= reach)) { bd = d; best = this.cmdProxy(c); }
       }
     }
     return best;
+  }
+
+  // Whether the GMs may take on this Zeon commander: a squad leader when the mission lets them take zones, an officer
+  // or Char always, none while it's dropping in or posing for its name card.
+  target(c) {
+    if (!c.alive || c.state === 'drop' || c.state === 'taunt' || this.game.cutsceneT > 0) return false;
+    return c.kind !== 'captain' || !!this.cfg?.allyCapture;
+  }
+
+  // What a blow from army `by` is worth against the other's: its `power` against a soldier, `vsLeader` of that against
+  // a field's leader, `vsOfficer` of it against a Zeon officer; `officer` for a Zeon commander's own blow on a GM.
+  scratch(by, { leader = false, officer = false } = {}) {
+    const C = (this.cfg || this.defaults())[by];
+    if (by === 'fed') return C.power * (officer ? C.vsOfficer : leader ? C.vsLeader : 1);
+    return (officer ? C.officer : C.power) * (leader ? C.vsLeader : 1);
+  }
+
+  defaults() {
+    return this._defaults || (this._defaults = {
+      fed: { power: NPC_VS_NPC, vsLeader: LEADER_ARMOR, vsOfficer: OFFICER_ARMOR },
+      zeon: { power: NPC_VS_NPC, vsLeader: LEADER_ARMOR, officer: OFFICER_BLOW },
+    });
   }
 
   // The leader of field f that the `team` attacking it has to fell: the pod's squad leader, or the GM leader.
@@ -157,32 +201,46 @@ export class War {
     return f.owner === 'fed' && f.captain ? f.captain.proxy : null;
   }
 
-  // A Zeon squad leader whose pilots are away takes on the GMs attacking its post (commander.js asks).
-  captainFoe(c) {
+  // The GM a Zeon commander turns on instead of the pilot (commander.js asks, once it has decided the pilot doesn't
+  // have its attention): the nearest within its reach that is nearer than the pilot, or any in reach when the pilot
+  // is gone. A squad leader only fights on its own ground, so its pilots can't lure it off its post. Once it has one
+  // it keeps it until it falls or gets away, so it doesn't dither between two. Null for the pilot.
+  commanderFoe(c, pilot) {
     if (!this.active || !this.game.allies.count) return null;
     const time = this.game.time;
-    if (time < (c.npcFoeT || 0)) return c.npcFoe && c.npcFoe.alive && c.npcFoe.id === c.npcFoeId ? c.npcFoe : null;
+    const cur = c.npcFoe && c.npcFoe.alive && c.npcFoe.id === c.npcFoeId ? c.npcFoe : null;
+    if (time < (c.npcFoeT || 0)) return cur;
     c.npcFoeT = time + 0.5;
-    const home = c.home || c.pos, leash = c.cfg.leash || 30;
-    let best = null, bd = 12;
+    const R = c.kind === 'char' ? 9 : c.kind === 'officer' ? 11 : 12;
+    const home = c.home, leash = c.cfg.leash || 30;
+    const pd = pilot.alive && pilot.state !== 'intro' ? Math.hypot(pilot.pos.x - c.pos.x, pilot.pos.z - c.pos.z) : Infinity;
+    const onGround = (o) => !home || Math.hypot(o.x - home.x, o.z - home.z) < leash;
+    if (cur && Math.hypot(cur.pos.x - c.pos.x, cur.pos.z - c.pos.z) < R + 4 && onGround(cur.unit)) return cur;
+    let best = null, bd = Math.min(R, pd);
     for (const o of this.game.allies.grid.query(c.pos.x, c.pos.z, bd, this._q)) {
       if (!o.alive || o.hp <= 0 || o.state === 'dying' || o.state === 'drop' || o.state === 'held') continue;
       const d = Math.hypot(o.x - c.pos.x, o.z - c.pos.z);
-      if (d < bd && Math.hypot(o.x - home.x, o.z - home.z) < leash) { bd = d; best = o.proxy; }
+      if (d < bd && onGround(o)) { bd = d; best = o.proxy; }
     }
     c.npcFoe = best;
     c.npcFoeId = best ? best.id : 0;
     return best;
   }
 
-  // A Zeon squad leader as the GMs see it.
+  // A Zeon commander as the GMs see it. officer: not a squad leader, so the GMs keep a ring round it (crowd.js).
   cmdProxy(c) {
+    const war = this;
     return c.proxy || (c.proxy = {
-      npc: true, unit: c, pos: c.pos, state: 'idle',
+      npc: true, unit: c, pos: c.pos, state: 'idle', officer: c.kind !== 'captain',
       get id() { return c.netId; },
-      get alive() { return c.alive && c.state !== 'drop' && c.state !== 'dying' && c.state !== 'dead'; },
-      takeHit: (dmg, x, z, heavy) => c.damage(dmg * NPC_VS_NPC * LEADER_ARMOR, heavy ? 5 : 2, 0, x, z, 0, { npc: true }),
+      get alive() { return war.target(c) && c.state !== 'dying' && c.state !== 'dead'; },
+      takeHit: (dmg, x, z, heavy) => c.damage(dmg * war.scratch('fed', c.kind === 'captain' ? { leader: true } : { officer: true }), heavy ? 5 : 2, 0, x, z, 0, { npc: true }),
     });
+  }
+
+  // How far down a Zeon officer the GMs' blows can take him (commander.js): the rest is the pilots'.
+  floor(c) {
+    return c.kind === 'captain' ? 0 : c.maxHp * FLOOR;
   }
 
   // A round from one army's gunner (b.team: 'fed', else Zeon) against the other army's soldiers and squad leaders.
@@ -195,14 +253,14 @@ export class War {
       for (const e of crowd.grid.query(b.p.x, b.p.z, 1.6, this._q)) {
         if (!e.alive || e.hp <= 0 || e.state === 'dying' || e.state === 'drop' || e.state === 'held') continue;
         const dx = b.p.x - e.x, dy = b.p.y - (e.y + 1.6), dz = b.p.z - e.z;
-        if (dx * dx + dy * dy * 0.4 + dz * dz < 1.3) { crowd.npcHit(e, b.dmg, fx, fz); return true; }
+        if (dx * dx + dy * dy * 0.4 + dz * dz < 1.3) { crowd.npcHit(e, b.dmg, fx, fz, false, !!b.officer); return true; }
       }
     }
-    if (fed && this.cfg.allyCapture) {
+    if (fed) {
       for (const c of g.commanders.list) {
-        if (c.kind !== 'captain' || !c.alive || c.state === 'drop') continue;
+        if (!this.target(c)) continue;
         const dx = b.p.x - c.pos.x, dy = b.p.y - (c.pos.y + 1.6), dz = b.p.z - c.pos.z;
-        if (dx * dx + dy * dy * 0.4 + dz * dz < 1.5) { c.damage(b.dmg * NPC_VS_NPC * LEADER_ARMOR, 1, 0, fx, fz, 0, { npc: true }); return true; }
+        if (dx * dx + dy * dy * 0.4 + dz * dz < 1.5) { this.cmdProxy(c).takeHit(b.dmg, fx, fz, false); return true; }
       }
     }
     return false;

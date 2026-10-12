@@ -1,8 +1,8 @@
 // Grunt crowds: instanced rendering + lightweight squad AI. Two armies share it: Zeon's Zaku II (team 'zeon', the
 // pilots' enemies) and the Federation's allied GMs (team 'fed', see war.js). Each soldier fights whatever it has
-// picked as its foe: for Zeon a pilot first, else the nearest GM; for a GM the nearest Zeon soldier or squad leader.
-// An enemy soldier is handed to the attack code as a proxy with a pilot's shape (pos, alive, state, takeHit), and a
-// blow between the armies only scratches (NPC_VS_NPC in war.js), so their brawls last minutes.
+// picked as its foe: for Zeon the pilot its front rank is on, else a GM in its face or in reach; for a GM the nearest
+// Zeon soldier or commander. An enemy soldier is handed to the attack code as a proxy with a pilot's shape (pos,
+// alive, state, takeHit), and what a blow between the armies is worth is the war's call (War.scratch).
 import * as THREE from 'three';
 import { InstancedRig, Clip, makePose, poseFrom, lerpPose, P, RPITCH, RROLL, RYAW } from '../core/rig.js';
 import { zakuDef, Z } from '../models/zaku.js';
@@ -10,13 +10,16 @@ import { gmDef, GM } from '../models/gm.js';
 import { SpatialHash, rand, clamp, angleDamp, wrapAngle, damp } from '../core/util.js';
 import { lensClear } from '../core/lensclear.js';
 import { gait, gaitSpec, gaitState } from '../core/gait.js';
-import { NPC_VS_NPC, LEADER_ARMOR } from './war.js';
 
 const MAX = 300;
 const GRAV = 30;
 const WALK = 3.7;
 const AGGRO = 22; // a garrison squad engages when a pilot comes this close
 const LEASH = 60; // ...and falls back to its post once every pilot is this far away
+const GM_REACH = 14; // a Zaku behind the front rank takes on an allied GM this close (and nearer than the pilot)
+const GM_FACE = 4.5; // ...and one of the front rank, a GM that has closed to this on it
+const GM_DRAW = 24; // GMs fighting this close to a pilot draw Zaku off its front rank, one each, up to half of it
+const BOSS_MELEE = 2; // GMs swinging at a Zeon officer at once; the rest keep a ring round him
 const AIM_T = 1.05; // how long a gunner shows its aim line before the burst
 const NPC_AIM_T = 0.6; // ...and how long it takes aim at another army's soldier (no line: that one isn't the pilot's)
 const PACE = WALK * 0.42; // a soldier at its post mills about at this amble
@@ -88,7 +91,7 @@ function proxyOf(crowd, g) {
     pos: { get x() { return g.x; }, get y() { return g.y; }, get z() { return g.z; } },
     get alive() { return g.alive && g.hp > 0 && g.state !== 'dying'; },
     get state() { return g.state === 'drop' || g.state === 'held' ? 'intro' : 'idle'; },
-    takeHit: (dmg, x, z, heavy) => crowd.npcHit(g, dmg, x, z, heavy),
+    takeHit: (dmg, x, z, heavy, kind) => crowd.npcHit(g, dmg, x, z, heavy, kind === 'officer'),
   };
 }
 
@@ -113,6 +116,8 @@ export class Crowd {
     this.foes = null; // the other army's crowd (main.js pairs them up)
     this.meleeTokens = 0;
     this.gunTokens = 0;
+    this.bossMelee = 0; // GMs in on a Zeon officer (BOSS_MELEE)
+    this.gmNear = 0; // GMs beside the pilots (Zeon: assignPress counts them, and the front rank thins for them)
     this.maxMelee = 3;
     this.maxGun = 1;
     this.nextVolley = 0; // game time before which no gunner may start another aim (shooting is rare, as in Reborn)
@@ -212,12 +217,13 @@ export class Crowd {
 
   clear() {
     while (this.list.length) this.remove(this.list[0]);
-    this.meleeTokens = this.gunTokens = 0;
+    this.meleeTokens = this.gunTokens = this.bossMelee = 0;
   }
 
   releaseToken(g) {
     if (g.token === 1) this.meleeTokens--;
     if (g.token === 2) this.gunTokens--;
+    if (g.token === 3) this.bossMelee--;
     g.token = 0;
   }
 
@@ -287,10 +293,12 @@ export class Crowd {
     return true;
   }
 
-  // A blow from the other army's soldier or squad leader: a scratch and a flinch.
-  npcHit(g, dmg, fromX, fromZ, heavy = false) {
+  // A blow from the other army's soldier or commander (officer: a Zeon commander's, worth more): what the war says
+  // it's worth (War.scratch), and a flinch.
+  npcHit(g, dmg, fromX, fromZ, heavy = false, officer = false) {
     if (!g.alive || g.hp <= 0 || g.state === 'dying' || g.state === 'held' || g.state === 'drop') return false;
-    const ok = this.damage(g, dmg * NPC_VS_NPC * (g.captain ? LEADER_ARMOR : 1), heavy ? 6 : 2.5, 0, fromX, fromZ, 0, { npc: true });
+    const k = this.game.war.scratch(this.team === 'fed' ? 'zeon' : 'fed', { leader: g.captain, officer });
+    const ok = this.damage(g, dmg * k, heavy ? 6 : 2.5, 0, fromX, fromZ, 0, { npc: true });
     if (ok && this.heard(g, 45)) {
       this.game.fx.sparks(this._v.set(g.x, g.y + 1.8, g.z), 3, 0xffc070, 6);
       this.game.audio.play('hit', { vol: 0.22, pitch: rand(0.9, 1.1), at: this._v });
@@ -410,9 +418,10 @@ export class Crowd {
     return cur;
   }
 
-  // Pick this soldier's foe. Zeon: the pilots keep priority as ever (the front rank, the gunners and any soldier the
-  // pilots are close to or its squad is fighting), and the rest take on an enemy soldier in reach. A GM: the nearest
-  // Zeon soldier or squad leader in reach, or nobody.
+  // Pick this soldier's foe. Zeon: with a pilot close (or its squad fighting one) the front rank stays on the pilot
+  // unless a GM has closed in on it (GM_FACE), a gunner unless a GM is nearer, and the rest of the ring turns on a GM
+  // that has come nearer than the pilot and within GM_REACH; with no pilot about, any enemy soldier in reach. A GM:
+  // the nearest Zeon soldier or commander in reach, or nobody.
   seek(g, players, war) {
     const npc = war ? war.foeFor(this, g) : null;
     if (this.team !== 'zeon') { this.setFoe(g, npc); return; }
@@ -422,7 +431,8 @@ export class Crowd {
     const nd = Math.hypot(npc.pos.x - g.x, npc.pos.z - g.z);
     const sq = g.squad;
     const onPilot = pd < AGGRO || (sq && sq.engaged && pd < 34);
-    this.setFoe(g, onPilot && (g.press || g.gun || nd > 7 || pd < nd) ? p : npc);
+    const stay = g.press ? nd > GM_FACE || pd <= nd : g.gun ? pd <= nd : nd > GM_REACH || pd <= nd;
+    this.setFoe(g, onPilot && stay ? p : npc);
   }
 
   setFoe(g, foe) {
@@ -439,7 +449,9 @@ export class Crowd {
     this.boomBudget = Math.min(6, this.boomBudget + dt * 18);
     this.grid.clear();
     for (const g of this.list) this.grid.insert(g, g.x, g.z);
+    // with GMs in the fight beside the pilots, one fewer Zaku swings at a pilot at a time
     const tokenScale = game.difficulty.aggression * players.length;
+    const melee = this.maxMelee * tokenScale - (this.gmNear >= 4 ? 1 : 0);
     if (this.team === 'zeon') this.assignPress(dt, players);
 
     for (let n = 0; n < this.list.length; n++) {
@@ -454,7 +466,18 @@ export class Crowd {
         if (g.seekT <= 0) { g.seekT = rand(0.3, 0.55); this.seek(g, players, war); }
       }
       let hero = g.foe;
-      if (hero && hero.npc && (!hero.alive || hero.id !== g.foeId)) hero = g.foe = null;
+      if (hero && hero.npc && (!hero.alive || hero.id !== g.foeId)) {
+        // the enemy soldier it was on is gone: an attack begun on it is called off, not swung at whoever is next (a
+        // swing that has already landed, and a burst already begun, play out: they can't reach anyone else)
+        hero = g.foe = null;
+        if (g.state === 'charge' || g.state === 'windup' || g.state === 'aim' || (g.state === 'strike' && g.t < 0.1)) {
+          this.releaseToken(g);
+          g.state = 'idle';
+          g.t = 0;
+          g.cd = rand(0.6, 1.2);
+          g.seekT = 0;
+        }
+      }
       if (!hero) hero = this.team === 'zeon' ? this.targetFor(g, players) : NOBODY;
       const npc = !!hero.npc;
       const hx = hero.pos.x, hz = hero.pos.z;
@@ -500,10 +523,17 @@ export class Crowd {
           if (heroTargetable && g.cd <= 0 && g.think <= 0) {
             g.think = rand(0.2, 0.5);
             if (npc) {
-              // another army's soldier: no tokens, no aim line, just a steady exchange of blows
-              if (!g.gun && dist < 7) { g.state = 'charge'; g.t = 0; break; }
+              // another army's soldier: no tokens, no aim line, just a steady exchange of blows. A Zeon officer: a
+              // couple of GMs step in to swing at a time, the rest keep a ring round him
+              const boss = !!hero.officer;
+              if (!g.gun && dist < (boss ? 7.5 : 7) && (!boss || this.bossMelee < BOSS_MELEE)) {
+                if (boss) { g.token = 3; this.bossMelee++; }
+                g.state = 'charge';
+                g.t = 0;
+                break;
+              }
               if (g.gun && dist < 20 && dist > 4) { this.startAim(g, hero, dist, toHero, true); break; }
-            } else if (!g.gun && g.press && dist < 11 && this.meleeTokens < this.maxMelee * tokenScale) {
+            } else if (!g.gun && g.press && dist < 11 && this.meleeTokens < melee) {
               g.token = 1;
               this.meleeTokens++;
               g.state = 'charge';
@@ -519,8 +549,9 @@ export class Crowd {
             }
           }
           // steer toward a ring slot around the hero: the front rank close in, the rest watch from further out
-          // (another army's soldier: straight into sword's reach, gunners a few lengths off)
-          const R = npc ? (g.gun ? 10 : 3.2) : g.gun || g.press ? g.ringR : g.outerR;
+          // (another army's soldier: straight into sword's reach, gunners a few lengths off; a Zeon officer: a ring
+          // a couple of lengths off unless it's this one's turn to step in)
+          const R = npc ? (g.gun ? 10 : hero.officer && g.token !== 3 ? 6.5 : 3.2) : g.gun || g.press ? g.ringR : g.outerR;
           let tx, tz;
           if (dist > 34) { tx = hx; tz = hz; }
           else {
@@ -579,7 +610,8 @@ export class Crowd {
             const fx = Math.sin(g.yaw), fz = Math.cos(g.yaw);
             const dot = (dx * fx + dz * fz) / (dist || 1);
             // after a blow lands the ring feints for a few seconds: pressure without a chip-damage grind
-            if (!g.feint && dist < 3.6 && dot > 0.35 && hero.pos.y < 2.5 && hero.takeHit(16 + rand(0, 7), g.x, g.z, false) && !npc) {
+            const blow = (16 + rand(0, 7)) * (g.captain ? 1.5 : 1); // a GM squad leader hits harder than its men
+            if (!g.feint && dist < 3.6 && dot > 0.35 && hero.pos.y < 2.5 && hero.takeHit(blow, g.x, g.z, false) && !npc) {
               this.feintUntil = game.time + rand(2.5, 4) / game.difficulty.aggression;
             }
             const lunge = g.feint ? 1.5 : npc ? 3 : 5; // feints stop short
@@ -607,7 +639,7 @@ export class Crowd {
             const from = this._v.set(g.x + fx * 1.9 - fz * 0.62, 2.35, g.z + fz * 1.9 + fx * 0.62);
             const a = g.aimYaw + rand(-0.025, 0.025);
             const dir = new THREE.Vector3(Math.sin(a), g.aimY, Math.cos(a)).normalize();
-            if (this.team === 'zeon') game.projectiles.enemyBullet(from, dir);
+            if (this.team === 'zeon') game.projectiles.enemyBullet(from, dir, 1, { npc: g.npcAim, fx: !g.npcAim || this.heard(g, 70) });
             else game.projectiles.allyBullet(from, dir, this.heard(g, 70));
           }
           if (g.t > 0.7) { this.releaseToken(g); g.state = 'idle'; g.cd = g.npcAim ? rand(5, 8) : rand(9, 14) / g.aggro; }
@@ -772,11 +804,21 @@ export class Crowd {
   }
 
   // Only the nearest few engaged soldiers per pilot may close in and swing; the rest form a watching ring
-  // further out, as in Dynasty Warriors. Re-ranked a few times a second.
+  // further out, as in Dynasty Warriors. GMs in the fight beside a pilot draw Zaku off the front rank, one each, up
+  // to half of it (the ring takes them on, see seek). Re-ranked a few times a second.
   assignPress(dt, players) {
     this.pressT -= dt;
     if (this.pressT > 0) return;
     this.pressT = 0.3;
+    this.gmNear = 0;
+    if (this.game.war?.active && this.foes && this.foes.count) {
+      for (const p of players) {
+        if (!p.alive) continue;
+        let n = 0;
+        for (const o of this.foes.grid.query(p.pos.x, p.pos.z, GM_DRAW, this.tmp)) if (o.alive && o.hp > 0 && o.foe && o.state !== 'drop' && Math.hypot(o.x - p.pos.x, o.z - p.pos.z) < GM_DRAW) n++;
+        this.gmNear = Math.max(this.gmNear, n);
+      }
+    }
     const cand = this._cand;
     cand.length = 0;
     for (const g of this.list) {
@@ -788,7 +830,8 @@ export class Crowd {
       cand.push(g);
     }
     cand.sort((a, b) => a.pd - b.pd);
-    const cap = Math.round(this.game.difficulty.maxPress * (players.length > 1 ? 1.6 : 1));
+    const full = Math.round(this.game.difficulty.maxPress * (players.length > 1 ? 1.6 : 1));
+    const cap = Math.max(Math.ceil(full / 2), full - this.gmNear);
     for (let i = 0; i < cand.length && i < cap; i++) cand[i].press = true;
   }
 
